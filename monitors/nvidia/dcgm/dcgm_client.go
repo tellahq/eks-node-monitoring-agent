@@ -54,7 +54,22 @@ type DCGMConfig struct {
 	// 'host:port' pair.
 	Address string
 
+	// InitializationGracePeriod is the window after a previously-successful
+	// DCGM connection is lost during which we silently swallow re-init errors
+	// instead of surfacing them as DCGMError to the manager. Used for runtime
+	// disconnects (nv-hostengine restart, transient network blip).
 	InitializationGracePeriod time.Duration
+
+	// BootGracePeriod is the window after the dcgmHelper is constructed
+	// (i.e. NMA pod boot) during which we silently swallow init errors,
+	// applied BEFORE we've ever successfully initialized DCGM. The boot
+	// race between the NMA pod's first reconcile and dcgm-server's
+	// nv-hostengine becoming reachable can take longer than the runtime
+	// InitializationGracePeriod is sized for; on production GPU nodes
+	// we have observed the race resolve in ~75-90s. After the first
+	// successful Init, this is no longer used and InitializationGracePeriod
+	// (sized for runtime disconnects) takes over.
+	BootGracePeriod time.Duration
 
 	// Features is a list of options to control which DCGM features to initialize.
 	Features []Feature
@@ -80,18 +95,37 @@ func NewDCGM(config DCGMConfig) *dcgmHelper {
 			config.Address = "localhost:5555"
 		}
 	}
+	now := time.Now()
 	return &dcgmHelper{
 		initialized:         false,
-		lastShutdown:        time.Now(),
+		everInitialized:     false,
+		constructedAt:       now,
+		lastShutdown:        now,
 		policyViolationChan: make(chan dcgmapi.PolicyViolation),
 		config:              config,
 	}
 }
 
 type dcgmHelper struct {
-	config           DCGMConfig
-	initialized      bool
-	lastShutdown     time.Time
+	config       DCGMConfig
+	initialized  bool
+	lastShutdown time.Time
+
+	// constructedAt is the time NewDCGM was called. Used as the start of
+	// the BootGracePeriod, which silences first-init errors for longer
+	// than the runtime InitializationGracePeriod allows (the boot race
+	// between NMA and nv-hostengine startup is observably longer than
+	// the runtime-disconnect window is sized for).
+	constructedAt time.Time
+
+	// everInitialized is set to true after the first successful
+	// dcgmapi.Init call. Distinguishes "we've never connected" (use
+	// BootGracePeriod) from "we've connected but lost the connection"
+	// (use InitializationGracePeriod). Without this, a node with a
+	// genuinely-broken DCGM driver could silently swallow errors for
+	// the entire boot grace window without ever surfacing the failure.
+	everInitialized bool
+
 	shutdownHandlers []func()
 	// a proxy channel to send real policy violation events into once the DCGM
 	// module has been initialized/reinitialized. this prevents edge cases
@@ -132,14 +166,19 @@ func (d *dcgmHelper) Reconcile(ctx context.Context) (bool, error) {
 	// already running nv-hostengine. The process needs to be running somewhere
 	// on the node reachable via hostNetworking.
 	if _, err := dcgmapi.Init(dcgmapi.Standalone, d.config.Address, "0"); err != nil {
-		// avoid returning a 'failed to initialize' error if we just
-		// disconnected from the DCGM host.
-		if time.Now().Before(d.lastShutdown.Add(d.config.InitializationGracePeriod)) {
+		// Silently swallow the error if we're still inside one of two
+		// grace windows: the BootGracePeriod (before any successful
+		// init) absorbs the boot race against nv-hostengine startup;
+		// the InitializationGracePeriod (after a previous shutdown)
+		// absorbs runtime disconnects from a running DCGM. See
+		// shouldSwallowInitError for the policy.
+		if d.shouldSwallowInitError(time.Now()) {
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to initialize DCGM: %w", err)
 	}
 	d.initialized = true
+	d.everInitialized = true
 
 	if slices.Contains(d.config.Features, FeaturePolicyViolations) {
 		// DCGM defines lets clients define error policies and notifies subscribers
@@ -242,6 +281,34 @@ func (d *dcgmHelper) GetDeviceCount() (uint, error) {
 		return 0, ErrNotInitialized
 	}
 	return dcgmapi.GetAllDeviceCount()
+}
+
+// shouldSwallowInitError returns true if a dcgmapi.Init failure at the given
+// time should be silently swallowed (returned to the manager as success-with-
+// no-init) rather than surfaced as a DCGMError condition. Two windows apply:
+//
+//   - Before any successful init has ever occurred (everInitialized=false),
+//     errors within BootGracePeriod after construction are swallowed. This
+//     covers the boot race between NMA pod startup and dcgm-server's
+//     nv-hostengine becoming reachable.
+//   - After a previous successful init that has since been shut down (e.g.
+//     because Introspect detected the connection dropped), errors within
+//     InitializationGracePeriod after lastShutdown are swallowed. This
+//     covers transient runtime disconnects.
+//
+// Both windows default to closed (no swallow) if their period is zero, so
+// this preserves prior behavior for callers that don't set BootGracePeriod.
+func (d *dcgmHelper) shouldSwallowInitError(now time.Time) bool {
+	if !d.everInitialized {
+		if d.config.BootGracePeriod <= 0 {
+			return false
+		}
+		return now.Before(d.constructedAt.Add(d.config.BootGracePeriod))
+	}
+	if d.config.InitializationGracePeriod <= 0 {
+		return false
+	}
+	return now.Before(d.lastShutdown.Add(d.config.InitializationGracePeriod))
 }
 
 func (d *dcgmHelper) shutdown() error {
