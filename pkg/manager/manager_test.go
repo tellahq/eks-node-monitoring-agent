@@ -290,11 +290,14 @@ func TestManager_AutoRecoveryReArmsAfterRecovery(t *testing.T) {
 	}
 	go func() { _ = mMgr.Start(ctx) }()
 
-	// Phase 1: monitor returns Fatal — wait for a delivered Fatal.
+	// Phase 1: monitor returns Fatal — wait for a delivered Fatal. Drain
+	// notifyChan to empty so phase 3's check below can't be confused by
+	// leftover buffered notifications from this phase.
 	mon.setEmit("fatal")
 	if err := waitFor(ctx, func() bool { return mockExp.setHealthyCalls() == 0 && mockExp.fatalDelivered() }, 8*time.Second); err != nil {
 		t.Fatalf("phase 1: never observed Fatal delivery: %v", err)
 	}
+	mockExp.drainNotify()
 
 	// Phase 2: monitor goes quiet — first recovery should fire.
 	mon.setEmit("none")
@@ -302,8 +305,11 @@ func TestManager_AutoRecoveryReArmsAfterRecovery(t *testing.T) {
 	if err := waitFor(ctx, func() bool { return mockExp.setHealthyCalls() >= wantCalls }, 10*time.Second); err != nil {
 		t.Fatalf("phase 2: first recovery never fired: %v", err)
 	}
+	mockExp.drainNotify()
 
-	// Phase 3: monitor goes Fatal again — recovery clock must re-arm.
+	// Phase 3: monitor goes Fatal again — recovery clock must re-arm. The
+	// drain above guarantees fatalDelivered() can only succeed via a fresh
+	// Fatal emitted in this phase, not via stale signal from phase 1.
 	mon.setEmit("fatal")
 	if err := waitFor(ctx, func() bool { return mockExp.fatalDelivered() }, 8*time.Second); err != nil {
 		t.Fatalf("phase 3: never observed re-Fatal delivery: %v", err)
@@ -363,15 +369,29 @@ func waitFor(ctx context.Context, predicate func() bool, timeout time.Duration) 
 	}
 }
 
-// fatalDelivered drains pending notifyChan signals and returns true if at
-// least one was observed since the last call (which is sufficient for
-// "Fatal was delivered" assertions in tests where the chatty path emits
-// every poll cycle).
+// fatalDelivered does a non-blocking receive on notifyChan and returns
+// true iff at least one delivery was buffered. Tests that need to observe
+// "Fatal was delivered IN THIS PHASE" should call drainNotify between
+// phases — otherwise this can falsely succeed from a stale buffered
+// notification left over by an earlier phase.
 func (e *mockExporter) fatalDelivered() bool {
 	select {
 	case <-e.notifyChan:
 		return true
 	default:
 		return false
+	}
+}
+
+// drainNotify empties notifyChan without blocking. Use between phases of
+// a multi-phase test to ensure fatalDelivered() in the next phase only
+// observes signal emitted during that phase.
+func (e *mockExporter) drainNotify() {
+	for {
+		select {
+		case <-e.notifyChan:
+		default:
+			return
+		}
 	}
 }

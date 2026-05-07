@@ -224,8 +224,9 @@ func (m *MonitorManager) maybeAutoRecover(ctx context.Context, monitorName strin
 	conditionType, ok := m.conditionTypeMap[monitorName]
 	if !ok {
 		// Defensive: a monitor in monitorFatalAt without a conditionType
-		// means Register's invariants were violated. Log and bail.
-		logger.Error(nil, "monitor has Fatal timestamp but no conditionType mapping",
+		// means Register's invariants were violated. Should be unreachable
+		// given Register populates both maps atomically; log and bail.
+		logger.Info("monitor has Fatal timestamp but no conditionType mapping; skipping recovery",
 			"monitor", monitorName,
 		)
 		return
