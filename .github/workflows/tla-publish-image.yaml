@@ -1,0 +1,90 @@
+name: '[tla] publish image'
+
+# Builds the eks-node-monitoring-agent image from this fork and pushes it to
+# Tella's ECR. Triggers on every push to tla_* branches and on tla_v* tags.
+#
+# Image tagging convention (mirrors tella-fusion):
+#   - branch push:  486029010931.dkr.ecr.us-east-2.amazonaws.com/eks-node-monitoring-agent:<branch>-<short-sha>-multi
+#   - tag push:     486029010931.dkr.ecr.us-east-2.amazonaws.com/eks-node-monitoring-agent:<tag>-multi
+#
+# Prerequisites (one-time, owned by infra):
+#   - ECR repository "eks-node-monitoring-agent" in account 486029010931 / us-east-2
+#   - IAM role "gha_eks_node_monitoring_agent_publisher" with:
+#       * Trust policy allowing GitHub OIDC for repo:tellahq/eks-node-monitoring-agent (any ref)
+#       * Permissions: ecr:GetAuthorizationToken (account-wide),
+#                      ecr:BatchCheckLayerAvailability/InitiateLayerUpload/UploadLayerPart/
+#                      CompleteLayerUpload/PutImage on the eks-node-monitoring-agent repo
+#   - GitHub repo variable AWS_ECR_PUBLISHER_ROLE_ARN set to the role ARN
+#
+# Override the role/region/repo via repo variables if those defaults change:
+#   AWS_REGION, AWS_ECR_REGISTRY, ECR_REPOSITORY
+
+on:
+  push:
+    branches:
+      - 'tla_*'
+    tags:
+      - 'tla_v*'
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC for AWS auth
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+  AWS_ECR_REGISTRY: ${{ vars.AWS_ECR_REGISTRY || '486029010931.dkr.ecr.us-east-2.amazonaws.com' }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'eks-node-monitoring-agent' }}
+
+jobs:
+  build-and-push:
+    name: build + push multi-arch image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}-multi"
+          else
+            short="$(git rev-parse --short=7 HEAD)"
+            ref_short="${GITHUB_REF_NAME//\//_}"
+            tag="${ref_short}-${short}-multi"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "image=${AWS_ECR_REGISTRY}/${ECR_REPOSITORY}:${tag}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Image tag::${AWS_ECR_REGISTRY}/${ECR_REPOSITORY}:${tag}"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUBLISHER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up QEMU (for multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build + push (linux/amd64,linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          provenance: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/tellahq/eks-node-monitoring-agent
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.vendor=Tella
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
