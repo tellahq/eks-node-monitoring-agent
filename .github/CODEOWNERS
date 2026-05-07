@@ -1,0 +1,24 @@
+# CODEOWNERS for tellahq/eks-node-monitoring-agent (fork of aws/eks-node-monitoring-agent)
+#
+# Any path that requires explicit reviewer approval — particularly anything
+# that affects CI authority (workflows touching OIDC, secrets, ECR pushes) —
+# must list owners here. Branch protection on tla_main has
+# `require_code_owner_reviews: true`, so PRs touching these paths cannot
+# merge without an approving review from a listed owner.
+
+# Default: any change to the fork needs an explicit reviewer.
+*                                  @tellahq/developers
+
+# CI / OIDC / publish authority — extra-sensitive. Anything in here that
+# triggers on push, dispatch, or schedule has the ability to assume the
+# github-actions-ecr OIDC role and push images to our ECR.
+/.github/                          @tellahq/developers
+/.github/workflows/                @tellahq/developers
+/.github/workflows/tla-*.yaml      @tellahq/developers
+
+# Dockerfile and build inputs feed the published image. A malicious change
+# here could ship a backdoored binary even if the workflow itself is clean.
+/Dockerfile                        @tellahq/developers
+/go.mod                            @tellahq/developers
+/go.sum                            @tellahq/developers
+
