@@ -342,3 +342,189 @@ func TestNodeExporter_LastTransitionTimeFlapping(t *testing.T) {
 		t.Errorf("Message was incorrectly updated with duplicates or cleared. expected: MessageA; MessageB, got: %s", latestMessage)
 	}
 }
+
+// TestNodeExporter_SetHealthyResetsAfterFatal verifies that SetHealthy flips a
+// condition that's currently False back to its configured ready state with
+// Status=ConditionTrue. This is the missing transition path that left
+// AcceleratedHardwareReady stuck False after transient DCGM probe failures.
+func TestNodeExporter_SetHealthyResetsAfterFatal(t *testing.T) {
+	ctx := context.TODO()
+	fakeClient := fake.NewFakeClient()
+	nodeName := "test-node"
+	initialNode := corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{},
+		},
+	}
+	if err := fakeClient.Create(ctx, &initialNode); err != nil {
+		t.Fatalf("failed to create initial node: %v", err)
+	}
+
+	conditionType := corev1.NodeConditionType("AcceleratedHardwareReady")
+	nodeExporter := manager.NewNodeExporter(
+		&initialNode,
+		fakeClient,
+		record.NewFakeRecorder(100),
+		map[corev1.NodeConditionType]manager.NodeConditionConfig{
+			conditionType: {
+				ReadyReason:  "NvidiaAcceleratedHardwareIsReady",
+				ReadyMessage: "GPU is healthy",
+			},
+		},
+	)
+
+	heartbeatChan := make(chan time.Time)
+	reportChan := make(chan time.Time)
+	go nodeExporter.RunWithTickers(ctx, heartbeatChan, reportChan)
+
+	// 1. Drive a Fatal so the local state goes False.
+	fatalCond := monitor.Condition{
+		Reason:   "DCGMError",
+		Message:  "failed to initialize DCGM",
+		Severity: monitor.SeverityFatal,
+	}
+	if err := nodeExporter.Fatal(ctx, fatalCond, conditionType); err != nil {
+		t.Fatal(err)
+	}
+	reportChan <- time.Now()
+
+	expectedFalse := corev1.NodeCondition{
+		Type:    conditionType,
+		Status:  corev1.ConditionFalse,
+		Reason:  "DCGMError",
+		Message: "failed to initialize DCGM",
+	}
+	if err := wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		var n corev1.Node
+		if err := fakeClient.Get(ctx, client.ObjectKey{Name: nodeName}, &n); err != nil {
+			return false, err
+		}
+		return nodeHasCondition(n, expectedFalse), nil
+	}); err != nil {
+		t.Fatalf("Fatal condition was not reported to node: %v", err)
+	}
+
+	// 2. Now SetHealthy and confirm the condition flips back to True with the
+	// configured ReadyReason/ReadyMessage.
+	if err := nodeExporter.SetHealthy(ctx, conditionType); err != nil {
+		t.Fatalf("SetHealthy failed: %v", err)
+	}
+	reportChan <- time.Now()
+
+	expectedTrue := corev1.NodeCondition{
+		Type:    conditionType,
+		Status:  corev1.ConditionTrue,
+		Reason:  "NvidiaAcceleratedHardwareIsReady",
+		Message: "GPU is healthy",
+	}
+	if err := wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		var n corev1.Node
+		if err := fakeClient.Get(ctx, client.ObjectKey{Name: nodeName}, &n); err != nil {
+			return false, err
+		}
+		return nodeHasCondition(n, expectedTrue), nil
+	}); err != nil {
+		t.Fatalf("SetHealthy did not flip condition back to True: %v", err)
+	}
+}
+
+// TestNodeExporter_SetHealthyPreservesTransitionTimeIfAlreadyTrue verifies that
+// repeated SetHealthy calls on an already-True condition don't churn the
+// LastTransitionTime — important so a happy-path monitor that's polled every
+// 5s with no errors doesn't update the transition time on every cycle.
+func TestNodeExporter_SetHealthyPreservesTransitionTimeIfAlreadyTrue(t *testing.T) {
+	ctx := context.TODO()
+	fakeClient := fake.NewFakeClient()
+	nodeName := "test-node"
+	initialNode := corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+	}
+	if err := fakeClient.Create(ctx, &initialNode); err != nil {
+		t.Fatalf("failed to create initial node: %v", err)
+	}
+
+	conditionType := corev1.NodeConditionType("AcceleratedHardwareReady")
+	nodeExporter := manager.NewNodeExporter(
+		&initialNode,
+		fakeClient,
+		record.NewFakeRecorder(100),
+		map[corev1.NodeConditionType]manager.NodeConditionConfig{
+			conditionType: {
+				ReadyReason:  "Healthy",
+				ReadyMessage: "All good",
+			},
+		},
+	)
+
+	heartbeatChan := make(chan time.Time)
+	reportChan := make(chan time.Time)
+	go nodeExporter.RunWithTickers(ctx, heartbeatChan, reportChan)
+
+	// Initial state from initializeManagedConditions is already True; flush it
+	// to the API.
+	if err := nodeExporter.SetHealthy(ctx, conditionType); err != nil {
+		t.Fatal(err)
+	}
+	reportChan <- time.Now()
+	time.Sleep(time.Millisecond * 100)
+
+	var n corev1.Node
+	if err := fakeClient.Get(ctx, client.ObjectKey{Name: nodeName}, &n); err != nil {
+		t.Fatal(err)
+	}
+	var ltt1 time.Time
+	for _, c := range n.Status.Conditions {
+		if c.Type == conditionType {
+			ltt1 = c.LastTransitionTime.Time
+		}
+	}
+	if ltt1.IsZero() {
+		t.Fatal("transition time not set")
+	}
+
+	// Sleep past metav1.Now()'s 1s resolution, then SetHealthy again. The
+	// transition time must NOT update because the status hasn't changed.
+	time.Sleep(time.Millisecond * 1100)
+	if err := nodeExporter.SetHealthy(ctx, conditionType); err != nil {
+		t.Fatal(err)
+	}
+	reportChan <- time.Now()
+	time.Sleep(time.Millisecond * 100)
+
+	if err := fakeClient.Get(ctx, client.ObjectKey{Name: nodeName}, &n); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range n.Status.Conditions {
+		if c.Type == conditionType {
+			if !c.LastTransitionTime.Time.Equal(ltt1) {
+				t.Errorf("LastTransitionTime updated on a no-op SetHealthy: was %v, now %v", ltt1, c.LastTransitionTime.Time)
+			}
+		}
+	}
+}
+
+// TestNodeExporter_SetHealthyUnknownConditionType ensures SetHealthy errors
+// (rather than panicking or silently writing) when called for a condition
+// type that wasn't registered with a NodeConditionConfig.
+func TestNodeExporter_SetHealthyUnknownConditionType(t *testing.T) {
+	ctx := context.TODO()
+	fakeClient := fake.NewFakeClient()
+	initialNode := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+	if err := fakeClient.Create(ctx, &initialNode); err != nil {
+		t.Fatalf("failed to create initial node: %v", err)
+	}
+
+	nodeExporter := manager.NewNodeExporter(
+		&initialNode,
+		fakeClient,
+		record.NewFakeRecorder(100),
+		map[corev1.NodeConditionType]manager.NodeConditionConfig{
+			"AcceleratedHardwareReady": {ReadyReason: "Healthy", ReadyMessage: "ok"},
+		},
+	)
+
+	if err := nodeExporter.SetHealthy(ctx, "NotRegistered"); err == nil {
+		t.Fatal("expected error for unregistered condition type, got nil")
+	}
+}

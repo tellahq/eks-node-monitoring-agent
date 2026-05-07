@@ -34,6 +34,15 @@ func init() {
 	)
 }
 
+// defaultRecoveryThreshold is how long a monitor must report no Fatal
+// conditions before the manager auto-recovers its managed condition back
+// to Healthy. Sized at ~6 polling cycles (poll interval is 5s) — long
+// enough that brief transients during reconcile don't bounce a True/False
+// flap, short enough that recovery happens well within Karpenter
+// NodeRepair's tolerationDuration so a transient False doesn't
+// false-positive trigger node replacement.
+const defaultRecoveryThreshold = 30 * time.Second
+
 // MonitorManager manages the lifecycle of monitors and routes their notifications
 type MonitorManager struct {
 	nodeName          string
@@ -43,6 +52,13 @@ type MonitorManager struct {
 	observers         map[string]observer.Observer
 	notifyChan        chan notification
 	exporter          Exporter
+
+	// monitorFatalAt tracks the most recent time each monitor emitted a
+	// Fatal condition. Used by the auto-recovery path: a monitor that's
+	// been quiet for `recoveryThreshold` after its last Fatal triggers
+	// SetHealthy on its managed condition.
+	monitorFatalAt    map[string]time.Time
+	recoveryThreshold time.Duration
 }
 
 type notification struct {
@@ -60,6 +76,8 @@ func NewMonitorManager(nodeName string, exporter Exporter) *MonitorManager {
 		observers:         make(map[string]observer.Observer),
 		notifyChan:        make(chan notification, 100),
 		exporter:          exporter,
+		monitorFatalAt:    make(map[string]time.Time),
+		recoveryThreshold: defaultRecoveryThreshold,
 	}
 }
 
@@ -68,6 +86,13 @@ func (m *MonitorManager) Register(ctx context.Context, mon monitor.Monitor, cond
 	m.monitors[mon.Name()] = mon
 	m.conditionTypeMap[mon.Name()] = conditionType
 	return mon.Register(ctx, makeManagerWrapper(m, mon))
+}
+
+// SetRecoveryThreshold overrides the auto-recovery quiet-period threshold
+// (default: defaultRecoveryThreshold). Primarily exposed so tests can drive
+// recovery without burning real wall-clock time.
+func (m *MonitorManager) SetRecoveryThreshold(d time.Duration) {
+	m.recoveryThreshold = d
 }
 
 // Start starts all observers and begins processing notifications
@@ -102,13 +127,34 @@ func (m *MonitorManager) runLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-pollTicker.C:
-			// Poll monitors for their current conditions
+			// Poll monitors for their current conditions. After processing each
+			// monitor's response, decide whether to auto-recover its managed
+			// condition: if the monitor returned no conditions at all and we
+			// previously recorded a Fatal for it, and enough wall-clock time
+			// has elapsed since that Fatal, flip the managed condition back to
+			// Healthy. This restores the missing Fatal -> True transition path
+			// for monitors that signal recovery via absence of conditions
+			// (the framework's documented contract — see
+			// monitors/nvidia/dcgm/dcgm_reconcile.go: success returns nil/nil).
 			for _, mon := range m.monitors {
-				for _, cond := range mon.Conditions() {
+				conds := mon.Conditions()
+				sawFatal := false
+				for _, cond := range conds {
 					if err := m.exportCondition(ctx, mon.Name(), cond); err != nil {
 						logger.Error(err, "failed to export condition", "source", mon.Name(), "condition", cond)
 					}
+					if cond.Severity == monitor.SeverityFatal {
+						sawFatal = true
+					}
 				}
+				if sawFatal {
+					m.monitorFatalAt[mon.Name()] = time.Now()
+				} else if len(conds) == 0 {
+					m.maybeAutoRecover(ctx, mon.Name())
+				}
+				// If conds is non-empty but contains only Info/Warning, the
+				// monitor is still signaling something — leave the managed
+				// condition alone and don't auto-recover yet.
 			}
 		case notif := <-m.notifyChan:
 			if err := m.exportCondition(ctx, notif.monitorName, notif.condition); err != nil {
@@ -117,8 +163,44 @@ func (m *MonitorManager) runLoop(ctx context.Context) error {
 					"condition", notif.condition,
 				)
 			}
+			if notif.condition.Severity == monitor.SeverityFatal {
+				m.monitorFatalAt[notif.monitorName] = time.Now()
+			}
 		}
 	}
+}
+
+// maybeAutoRecover flips the managed condition for the named monitor back to
+// Healthy if it previously emitted Fatal and has been quiet for at least
+// recoveryThreshold. No-op if the monitor never emitted Fatal, or if not
+// enough time has passed since the most recent Fatal.
+func (m *MonitorManager) maybeAutoRecover(ctx context.Context, monitorName string) {
+	logger := log.FromContext(ctx)
+	fatalAt, ok := m.monitorFatalAt[monitorName]
+	if !ok {
+		return
+	}
+	if time.Since(fatalAt) < m.recoveryThreshold {
+		return
+	}
+	conditionType, ok := m.conditionTypeMap[monitorName]
+	if !ok {
+		return
+	}
+	if err := m.exporter.SetHealthy(ctx, conditionType); err != nil {
+		logger.Error(err, "failed to auto-recover condition",
+			"monitor", monitorName,
+			"conditionType", conditionType,
+		)
+		return
+	}
+	logger.Info("auto-recovered managed condition to healthy",
+		"monitor", monitorName,
+		"conditionType", conditionType,
+		"quietFor", time.Since(fatalAt).Round(time.Second).String(),
+	)
+	delete(m.monitorFatalAt, monitorName)
+	conditionTypeGauge.WithLabelValues(string(conditionType)).Set(0)
 }
 
 func (m *MonitorManager) exportCondition(ctx context.Context, monitorName string, condition monitor.Condition) error {

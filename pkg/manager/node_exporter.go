@@ -42,12 +42,13 @@ func NewNodeExporter(
 	managedConditionConfigs map[corev1.NodeConditionType]NodeConditionConfig,
 ) *nodeExporter {
 	return &nodeExporter{
-		nodeRef:                makeNodeReference(node),
-		nodeKey:                client.ObjectKeyFromObject(node),
-		kubeClient:             kubeClient,
-		recorder:               recorder,
-		managedConditions:      initializeManagedConditions(managedConditionConfigs),
-		managedConditionsDirty: true,
+		nodeRef:                 makeNodeReference(node),
+		nodeKey:                 client.ObjectKeyFromObject(node),
+		kubeClient:              kubeClient,
+		recorder:                recorder,
+		managedConditionConfigs: managedConditionConfigs,
+		managedConditions:       initializeManagedConditions(managedConditionConfigs),
+		managedConditionsDirty:  true,
 	}
 }
 
@@ -88,6 +89,10 @@ type nodeExporter struct {
 	recorder   record.EventRecorder
 	nodeRef    *corev1.ObjectReference
 	nodeKey    client.ObjectKey
+
+	// managedConditionConfigs holds the per-condition ready-state config
+	// (ReadyReason/ReadyMessage) retained for SetHealthy.
+	managedConditionConfigs map[corev1.NodeConditionType]NodeConditionConfig
 
 	managedConditions      map[corev1.NodeConditionType]corev1.NodeCondition
 	managedConditionsDirty bool
@@ -134,6 +139,39 @@ func (e *nodeExporter) Fatal(ctx context.Context, monitorCondition monitor.Condi
 				newCondition.Message = oldCondition.Message
 			}
 		}
+	}
+	e.managedConditions[conditionType] = newCondition
+	e.managedConditionsDirty = true
+	return nil
+}
+
+// SetHealthy resets the managed condition for the given conditionType back to
+// its configured ready state (Status: ConditionTrue, Reason/Message from the
+// NodeConditionConfig passed to NewNodeExporter). Used by the manager's
+// auto-recovery path to flip a previously-Fatal condition back to True once
+// the underlying monitor has stopped reporting errors for the recovery
+// threshold. If the condition was already True the local state is left intact
+// (LastTransitionTime preserved) so we don't generate spurious flap.
+func (e *nodeExporter) SetHealthy(ctx context.Context, conditionType corev1.NodeConditionType) error {
+	config, ok := e.managedConditionConfigs[conditionType]
+	if !ok {
+		return fmt.Errorf("no NodeConditionConfig registered for condition type %q", conditionType)
+	}
+	e.managedConditionsLock.Lock()
+	defer e.managedConditionsLock.Unlock()
+	now := metav1.Now()
+	newCondition := corev1.NodeCondition{
+		Type:               conditionType,
+		Reason:             config.ReadyReason,
+		Message:            config.ReadyMessage,
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: now,
+		LastHeartbeatTime:  now,
+	}
+	if old, ok := e.managedConditions[conditionType]; ok && old.Status == corev1.ConditionTrue {
+		// Already healthy — preserve the existing transition time so the
+		// recovery isn't recorded as a fresh transition every poll cycle.
+		newCondition.LastTransitionTime = old.LastTransitionTime
 	}
 	e.managedConditions[conditionType] = newCondition
 	e.managedConditionsDirty = true
