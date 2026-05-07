@@ -7,17 +7,18 @@ name: '[tla] publish image'
 #   - branch push:  486029010931.dkr.ecr.us-east-2.amazonaws.com/eks-node-monitoring-agent:<branch>-<short-sha>-multi
 #   - tag push:     486029010931.dkr.ecr.us-east-2.amazonaws.com/eks-node-monitoring-agent:<tag>-multi
 #
-# Prerequisites (one-time, owned by infra):
-#   - ECR repository "eks-node-monitoring-agent" in account 486029010931 / us-east-2
-#   - IAM role "gha_eks_node_monitoring_agent_publisher" with:
-#       * Trust policy allowing GitHub OIDC for repo:tellahq/eks-node-monitoring-agent (any ref)
-#       * Permissions: ecr:GetAuthorizationToken (account-wide),
-#                      ecr:BatchCheckLayerAvailability/InitiateLayerUpload/UploadLayerPart/
-#                      CompleteLayerUpload/PutImage on the eks-node-monitoring-agent repo
-#   - GitHub repo variable AWS_ECR_PUBLISHER_ROLE_ARN set to the role ARN
+# Prerequisites (provisioned by shared-infra; see PR #34):
+#   - ECR repository "eks-node-monitoring-agent" in 486029010931 / us-east-2
+#     (module: shared-infra/modules/eks-node-monitoring-agent-ecr)
+#   - The shared "github-actions-ecr" OIDC role (module:
+#     shared-infra/modules/security/github-oidc) has account-wide ECR push
+#     permissions and trusts repo:tellahq/eks-node-monitoring-agent:* via
+#     repo_patterns. No new role needed; reuse the shared one.
+#   - GitHub repo variable AWS_ECR_PUBLISHER_ROLE_ARN set to
+#     arn:aws:iam::486029010931:role/github-actions-ecr
 #
-# Override the role/region/repo via repo variables if those defaults change:
-#   AWS_REGION, AWS_ECR_REGISTRY, ECR_REPOSITORY
+# Override region/repo/role via GH repo variables if defaults change:
+#   AWS_REGION, AWS_ECR_REGISTRY, ECR_REPOSITORY, AWS_ECR_PUBLISHER_ROLE_ARN
 
 on:
   push:
