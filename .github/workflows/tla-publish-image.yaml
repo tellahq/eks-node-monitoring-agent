@@ -3,9 +3,22 @@ name: '[tla] publish image'
 # Builds the eks-node-monitoring-agent image from this fork and pushes it to
 # Tella's ECR. Triggers on every push to tla_* branches and on tla_v* tags.
 #
-# Image tagging convention (mirrors tella-fusion):
-#   - branch push:  486029010931.dkr.ecr.us-east-2.amazonaws.com/eks-node-monitoring-agent:<branch>-<short-sha>-multi
-#   - tag push:     486029010931.dkr.ecr.us-east-2.amazonaws.com/eks-node-monitoring-agent:<tag>-multi
+# Build shape mirrors tella-fusion's reusable-build-container-image.yml:
+#   - prepare       (compute tags)
+#   - build-amd64   (native amd64 runner)  ┐ run in parallel
+#   - build-arm64   (native arm64 runner)  ┘
+#   - manifest      (fuse the per-arch images into a -multi manifest)
+#
+# Native runners (no QEMU emulation) — the previous single-buildx approach
+# with platforms=linux/amd64,linux/arm64 routinely stalled past 20 min on
+# the arm64 leg under QEMU. Native parallel cuts wall-clock to ~max(amd64,
+# arm64) + 30s manifest push.
+#
+# Image tagging:
+#   - branch push:  486029010931.dkr.ecr.us-east-2.amazonaws.com/eks-node-monitoring-agent:<branch>-<short-sha>-{amd64,arm64,multi}
+#   - tag push:     486029010931.dkr.ecr.us-east-2.amazonaws.com/eks-node-monitoring-agent:<tag>-{amd64,arm64,multi}
+# Consumers should reference the `-multi` tag; the per-arch tags exist so
+# `docker buildx imagetools create` has something to point at.
 #
 # Prerequisites (provisioned by shared-infra; see PR #34):
 #   - ECR repository "eks-node-monitoring-agent" in 486029010931 / us-east-2
@@ -38,54 +51,124 @@ env:
   ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'eks-node-monitoring-agent' }}
 
 jobs:
-  build-and-push:
-    name: build + push multi-arch image
+  prepare:
+    name: compute tags
     runs-on: ubuntu-latest
+    outputs:
+      tag_base: ${{ steps.tags.outputs.tag_base }}
+      amd64_uri: ${{ steps.tags.outputs.amd64_uri }}
+      arm64_uri: ${{ steps.tags.outputs.arm64_uri }}
+      manifest_uri: ${{ steps.tags.outputs.manifest_uri }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Compute image tag
-        id: meta
+      - name: Compute tag base + per-arch + manifest URIs
+        id: tags
         run: |
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            tag="${GITHUB_REF#refs/tags/}-multi"
+            base="${GITHUB_REF#refs/tags/}"
           else
-            short="$(git rev-parse --short=7 HEAD)"
             ref_short="${GITHUB_REF_NAME//\//_}"
-            tag="${ref_short}-${short}-multi"
+            base="${ref_short}-$(git rev-parse --short=7 HEAD)"
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "image=${AWS_ECR_REGISTRY}/${ECR_REPOSITORY}:${tag}" >> "$GITHUB_OUTPUT"
-          echo "::notice title=Image tag::${AWS_ECR_REGISTRY}/${ECR_REPOSITORY}:${tag}"
+          repo="${AWS_ECR_REGISTRY}/${ECR_REPOSITORY}"
+          {
+            echo "tag_base=$base"
+            echo "amd64_uri=${repo}:${base}-amd64"
+            echo "arm64_uri=${repo}:${base}-arm64"
+            echo "manifest_uri=${repo}:${base}-multi"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice title=Image::${repo}:${base}-multi"
 
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+  build-amd64:
+    name: build amd64
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ECR_PUBLISHER_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to ECR
-        uses: aws-actions/amazon-ecr-login@v2
+      - uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set up QEMU (for multi-arch)
-        uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build + push (linux/amd64,linux/arm64)
+      - name: Build + push (linux/amd64)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
-          tags: ${{ steps.meta.outputs.image }}
+          tags: ${{ needs.prepare.outputs.amd64_uri }}
           provenance: false
           labels: |
             org.opencontainers.image.source=https://github.com/tellahq/eks-node-monitoring-agent
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.vendor=Tella
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
+
+  build-arm64:
+    name: build arm64
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUBLISHER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build + push (linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ needs.prepare.outputs.arm64_uri }}
+          provenance: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/tellahq/eks-node-monitoring-agent
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.vendor=Tella
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,mode=max,scope=arm64
+
+  manifest:
+    name: fuse multi-arch manifest
+    needs: [prepare, build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUBLISHER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create + push multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t ${{ needs.prepare.outputs.manifest_uri }} \
+            ${{ needs.prepare.outputs.amd64_uri }} \
+            ${{ needs.prepare.outputs.arm64_uri }}
+          echo "::notice title=Published image::${{ needs.prepare.outputs.manifest_uri }}"
