@@ -25,13 +25,17 @@ func (m *mockMonitor) Register(ctx context.Context, mgr monitor.Manager) error {
 	return m.registerFunc(ctx, mgr)
 }
 
+// notifyChanBufferSize is sized at the worst case for the slowest test in
+// this file: ~12 seconds of test runtime, ~2 polling cycles (5s each), each
+// emitting up to ~3 conditions per monitor — so an unread chan would back up
+// at most ~6-10 items. 256 is comfortably more than that, with no realistic
+// risk of test deadlock. The earlier unbuffered version would block runLoop
+// on the first unread Fatal.
+const notifyChanBufferSize = 256
+
 func NewManagerWithExporterFuncs(fns ...func(*mockExporter)) (*manager.MonitorManager, *mockExporter) {
 	mockExp := &mockExporter{
-		// Buffered so a polling-loop monitor that reports Fatal repeatedly
-		// doesn't block runLoop on an unread channel send. Existing tests
-		// that read exactly once still work; new tests that drain in a
-		// fan-out also work.
-		notifyChan: make(chan struct{}, 256),
+		notifyChan: make(chan struct{}, notifyChanBufferSize),
 	}
 	for _, fn := range fns {
 		fn(mockExp)
@@ -40,16 +44,25 @@ func NewManagerWithExporterFuncs(fns ...func(*mockExporter)) (*manager.MonitorMa
 	return mockManager, mockExp
 }
 
+// NewManagerWithOptions is a test helper for cases that need to construct
+// the MonitorManager with non-default options (e.g. a tighter recovery
+// threshold). Mirrors NewManagerWithExporterFuncs but plumbs through opts.
+func NewManagerWithOptions(opts ...manager.Option) (*manager.MonitorManager, *mockExporter) {
+	mockExp := &mockExporter{notifyChan: make(chan struct{}, notifyChanBufferSize)}
+	mockManager := manager.NewMonitorManager("mock", mockExp, opts...)
+	return mockManager, mockExp
+}
+
 // mockExporter implements manager.Exporter for tests. Info/Warning/Fatal push
 // onto notifyChan so tests can synchronously block-and-wait for an export.
-// SetHealthy increments setHealthyCount atomically; tests assert on the
-// counter value, which is more reliable than a buffered-channel idiom that
-// loses signal under racy schedules and can hide regressions where
-// SetHealthy is called too often.
+// Healthy increments healthyCount atomically; tests assert on the counter
+// value, which is more reliable than a buffered-channel idiom that loses
+// signal under racy schedules and can hide regressions where Healthy is
+// called too often.
 type mockExporter struct {
-	notifyChan       chan struct{}
-	setHealthyCount  atomic.Int64
-	setHealthyByType sync.Map // map[corev1.NodeConditionType]int64
+	notifyChan    chan struct{}
+	healthyCount  atomic.Int64
+	healthyByType sync.Map // map[corev1.NodeConditionType]int64
 }
 
 func (e *mockExporter) notify() error {
@@ -65,17 +78,17 @@ func (e *mockExporter) Warning(context.Context, monitor.Condition, corev1.NodeCo
 func (e *mockExporter) Fatal(context.Context, monitor.Condition, corev1.NodeConditionType) error {
 	return e.notify()
 }
-func (e *mockExporter) SetHealthy(_ context.Context, ct corev1.NodeConditionType) error {
-	e.setHealthyCount.Add(1)
-	v, _ := e.setHealthyByType.LoadOrStore(ct, new(int64))
+func (e *mockExporter) Healthy(_ context.Context, ct corev1.NodeConditionType) error {
+	e.healthyCount.Add(1)
+	v, _ := e.healthyByType.LoadOrStore(ct, new(int64))
 	atomic.AddInt64(v.(*int64), 1)
 	return nil
 }
 
-// setHealthyCalls returns the total number of SetHealthy invocations across
-// all condition types.
-func (e *mockExporter) setHealthyCalls() int64 {
-	return e.setHealthyCount.Load()
+// healthyCalls returns the total number of Healthy invocations across all
+// condition types.
+func (e *mockExporter) healthyCalls() int64 {
+	return e.healthyCount.Load()
 }
 
 func TestManager_Notification(t *testing.T) {
@@ -202,8 +215,7 @@ func TestManager_AutoRecoveryAfterFatalGoesQuiet(t *testing.T) {
 		},
 	}
 
-	mMgr, mockExp := NewManagerWithExporterFuncs()
-	mMgr.SetRecoveryThreshold(50 * time.Millisecond)
+	mMgr, mockExp := NewManagerWithOptions(manager.WithRecoveryThreshold(50 * time.Millisecond))
 
 	if err := mMgr.Register(ctx, mockMon, "AcceleratedHardwareReady"); err != nil {
 		t.Fatal(err)
@@ -217,16 +229,16 @@ func TestManager_AutoRecoveryAfterFatalGoesQuiet(t *testing.T) {
 		t.Fatal("Fatal was never delivered to exporter:", ctx.Err())
 	}
 
-	// Then expect SetHealthy on a subsequent poll cycle (after recovery
+	// Then expect Healthy on a subsequent poll cycle (after recovery
 	// threshold elapses and the poll ticker fires — within ~5-10s).
 	for {
-		if mockExp.setHealthyCalls() >= 1 {
+		if mockExp.healthyCalls() >= 1 {
 			return
 		}
 		select {
 		case <-time.After(100 * time.Millisecond):
 		case <-ctx.Done():
-			t.Fatalf("auto-recovery never fired (SetHealthy not called): %v", ctx.Err())
+			t.Fatalf("auto-recovery never fired (Healthy not called): %v", ctx.Err())
 		}
 	}
 }
@@ -241,15 +253,14 @@ func TestManager_NoRecoveryWhileMonitorStillReportingFatal(t *testing.T) {
 
 	mockMon := &chattyFatalMonitor{}
 
-	mMgr, mockExp := NewManagerWithExporterFuncs()
-	mMgr.SetRecoveryThreshold(50 * time.Millisecond)
+	mMgr, mockExp := NewManagerWithOptions(manager.WithRecoveryThreshold(50 * time.Millisecond))
 
 	if err := mMgr.Register(ctx, mockMon, "AcceleratedHardwareReady"); err != nil {
 		t.Fatal(err)
 	}
 	go func() { _ = mMgr.Start(ctx) }()
 
-	// Wait the full test window. SetHealthy should never be called — the
+	// Wait the full test window. Healthy should never be called — the
 	// monitor keeps emitting Fatal so the recovery clock keeps resetting.
 	gotFatal := false
 	deadline := time.NewTimer(11 * time.Second)
@@ -268,8 +279,8 @@ loop:
 	if !gotFatal {
 		t.Fatalf("never received a Fatal — test setup wrong")
 	}
-	if calls := mockExp.setHealthyCalls(); calls != 0 {
-		t.Fatalf("SetHealthy was called %d times while monitor was still reporting Fatal — auto-recovery should not fire", calls)
+	if calls := mockExp.healthyCalls(); calls != 0 {
+		t.Fatalf("Healthy was called %d times while monitor was still reporting Fatal — auto-recovery should not fire", calls)
 	}
 }
 
@@ -282,8 +293,7 @@ func TestManager_AutoRecoveryReArmsAfterRecovery(t *testing.T) {
 	defer cancel()
 
 	mon := &switchableMonitor{}
-	mMgr, mockExp := NewManagerWithExporterFuncs()
-	mMgr.SetRecoveryThreshold(50 * time.Millisecond)
+	mMgr, mockExp := NewManagerWithOptions(manager.WithRecoveryThreshold(50 * time.Millisecond))
 
 	if err := mMgr.Register(ctx, mon, "AcceleratedHardwareReady"); err != nil {
 		t.Fatal(err)
@@ -294,7 +304,7 @@ func TestManager_AutoRecoveryReArmsAfterRecovery(t *testing.T) {
 	// notifyChan to empty so phase 3's check below can't be confused by
 	// leftover buffered notifications from this phase.
 	mon.setEmit("fatal")
-	if err := waitFor(ctx, func() bool { return mockExp.setHealthyCalls() == 0 && mockExp.fatalDelivered() }, 8*time.Second); err != nil {
+	if err := waitFor(ctx, func() bool { return mockExp.healthyCalls() == 0 && mockExp.fatalDelivered() }, 8*time.Second); err != nil {
 		t.Fatalf("phase 1: never observed Fatal delivery: %v", err)
 	}
 	mockExp.drainNotify()
@@ -302,7 +312,7 @@ func TestManager_AutoRecoveryReArmsAfterRecovery(t *testing.T) {
 	// Phase 2: monitor goes quiet — first recovery should fire.
 	mon.setEmit("none")
 	wantCalls := int64(1)
-	if err := waitFor(ctx, func() bool { return mockExp.setHealthyCalls() >= wantCalls }, 10*time.Second); err != nil {
+	if err := waitFor(ctx, func() bool { return mockExp.healthyCalls() >= wantCalls }, 10*time.Second); err != nil {
 		t.Fatalf("phase 2: first recovery never fired: %v", err)
 	}
 	mockExp.drainNotify()
@@ -317,8 +327,8 @@ func TestManager_AutoRecoveryReArmsAfterRecovery(t *testing.T) {
 
 	// Phase 4: monitor quiet again — second recovery should fire (counter > 1).
 	mon.setEmit("none")
-	wantCalls = mockExp.setHealthyCalls() + 1
-	if err := waitFor(ctx, func() bool { return mockExp.setHealthyCalls() >= wantCalls }, 10*time.Second); err != nil {
+	wantCalls = mockExp.healthyCalls() + 1
+	if err := waitFor(ctx, func() bool { return mockExp.healthyCalls() >= wantCalls }, 10*time.Second); err != nil {
 		t.Fatalf("phase 4: second recovery never fired (re-arm broken): %v", err)
 	}
 }

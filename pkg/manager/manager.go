@@ -37,12 +37,18 @@ func init() {
 
 // defaultRecoveryThreshold is how long a monitor must go without emitting
 // a Fatal condition before the manager auto-recovers its managed condition
-// back to Healthy. Sized at ~6 polling cycles (poll interval is 5s) so
-// brief transients during reconcile don't bounce a True/False flap, and
-// well below Karpenter NodeRepair's per-condition tolerationDuration
-// (which is on the order of minutes for most conditions) so a transient
-// False that resolves quickly doesn't false-positive trigger node
-// replacement.
+// back to Healthy.
+//
+// Chosen as 30s because:
+//   - it is 6× the polling interval (5s), so brief transients during a
+//     single reconcile cycle don't bounce a True/False flap.
+//   - it is well below Karpenter NodeRepair's per-condition
+//     tolerationDuration (minutes-scale for the conditions this manager
+//     publishes), so a transient False that resolves quickly cannot
+//     false-positive trigger a node replacement.
+//   - operators with slower or less predictable monitor reconcile latencies
+//     (e.g. multi-GPU bootstrap on p4d/p5 hardware where DCGM probe takes
+//     longer than g4dn) can override via WithRecoveryThreshold.
 const defaultRecoveryThreshold = 30 * time.Second
 
 // MonitorManager manages the lifecycle of monitors and routes their notifications
@@ -75,9 +81,26 @@ type notification struct {
 	condition   monitor.Condition
 }
 
-// NewMonitorManager creates a new monitor manager
-func NewMonitorManager(nodeName string, exporter Exporter) *MonitorManager {
-	return &MonitorManager{
+// Option configures a MonitorManager at construction.
+type Option func(*MonitorManager)
+
+// WithRecoveryThreshold overrides the auto-recovery quiet-period threshold.
+// A monitor that previously emitted a Fatal must go this long without
+// emitting another Fatal before the manager auto-flips the managed
+// condition back to Healthy. Defaults to defaultRecoveryThreshold (30s).
+//
+// Tune longer for environments where monitor reconcile latency is
+// inherently variable (e.g. large multi-GPU instances where DCGM probes
+// take longer to settle); tune shorter for tests.
+func WithRecoveryThreshold(d time.Duration) Option {
+	return func(m *MonitorManager) {
+		m.recoveryThreshold = d
+	}
+}
+
+// NewMonitorManager creates a new monitor manager.
+func NewMonitorManager(nodeName string, exporter Exporter, opts ...Option) *MonitorManager {
+	m := &MonitorManager{
 		nodeName:          nodeName,
 		monitors:          make(map[string]monitor.Monitor),
 		conditionTypeMap:  make(map[string]corev1.NodeConditionType),
@@ -88,6 +111,10 @@ func NewMonitorManager(nodeName string, exporter Exporter) *MonitorManager {
 		monitorFatalAt:    make(map[string]time.Time),
 		recoveryThreshold: defaultRecoveryThreshold,
 	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
 }
 
 // Register registers a monitor with the manager.
@@ -110,13 +137,6 @@ func (m *MonitorManager) Register(ctx context.Context, mon monitor.Monitor, cond
 	m.monitors[mon.Name()] = mon
 	m.conditionTypeMap[mon.Name()] = conditionType
 	return mon.Register(ctx, makeManagerWrapper(m, mon))
-}
-
-// SetRecoveryThreshold overrides the auto-recovery quiet-period threshold
-// (default: defaultRecoveryThreshold). Primarily exposed so tests can drive
-// recovery without burning real wall-clock time.
-func (m *MonitorManager) SetRecoveryThreshold(d time.Duration) {
-	m.recoveryThreshold = d
 }
 
 // Start starts all observers and begins processing notifications
@@ -162,6 +182,15 @@ func (m *MonitorManager) runLoop(ctx context.Context) error {
 			// non-Fatal severities (Info/Warning) only produce events and
 			// don't write the managed condition — so their presence isn't
 			// evidence of an unhealthy managed-condition state.
+			//
+			// Caveat on the Fatal -> Warning case: a monitor that
+			// transitions from emitting Fatal to emitting Warning will
+			// trigger recovery. The managed condition will read True while
+			// the monitor is still actively emitting Warning events. This
+			// is by design — managed conditions track the Fatal severity
+			// only; Info/Warning are an event-only signal. Consumers that
+			// need to distinguish "fully healthy" from "degraded but
+			// recovered" should observe events alongside the condition.
 			for _, mon := range m.monitors {
 				conds := mon.Conditions()
 				sawFatalDelivered := false
@@ -231,7 +260,7 @@ func (m *MonitorManager) maybeAutoRecover(ctx context.Context, monitorName strin
 		)
 		return
 	}
-	if err := m.exporter.SetHealthy(ctx, conditionType); err != nil {
+	if err := m.exporter.Healthy(ctx, conditionType); err != nil {
 		logger.Error(err, "failed to auto-recover condition",
 			"monitor", monitorName,
 			"conditionType", conditionType,
@@ -246,6 +275,9 @@ func (m *MonitorManager) maybeAutoRecover(ctx context.Context, monitorName strin
 	m.monitorFatalAtMu.Lock()
 	delete(m.monitorFatalAt, monitorName)
 	m.monitorFatalAtMu.Unlock()
+	// Zero the per-conditionType gauge. Safe because Register enforces
+	// one-monitor-per-conditionType: there can't be another monitor still
+	// in Fatal state for this gauge label.
 	conditionTypeGauge.WithLabelValues(string(conditionType)).Set(0)
 }
 

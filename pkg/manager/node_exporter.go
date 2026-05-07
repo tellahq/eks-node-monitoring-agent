@@ -145,7 +145,7 @@ func (e *nodeExporter) Fatal(ctx context.Context, monitorCondition monitor.Condi
 	return nil
 }
 
-// SetHealthy resets the managed condition for the given conditionType back to
+// Healthy resets the managed condition for the given conditionType back to
 // its configured ready state (Status: ConditionTrue, Reason/Message from the
 // NodeConditionConfig passed to NewNodeExporter). Used by the manager's
 // auto-recovery path to flip a previously-Fatal condition back to True once
@@ -153,8 +153,8 @@ func (e *nodeExporter) Fatal(ctx context.Context, monitorCondition monitor.Condi
 // threshold. If the local cache already reflects the configured ready state
 // this is a pure no-op (no dirty bit, no apiserver patch on the next report
 // tick) — a small but useful optimization since maybeAutoRecover may end up
-// calling SetHealthy on every poll cycle for monitors that never go Fatal.
-func (e *nodeExporter) SetHealthy(ctx context.Context, conditionType corev1.NodeConditionType) error {
+// calling Healthy on every poll cycle for monitors that never go Fatal.
+func (e *nodeExporter) Healthy(ctx context.Context, conditionType corev1.NodeConditionType) error {
 	config, ok := e.managedConditionConfigs[conditionType]
 	if !ok {
 		return fmt.Errorf("no NodeConditionConfig registered for condition type %q", conditionType)

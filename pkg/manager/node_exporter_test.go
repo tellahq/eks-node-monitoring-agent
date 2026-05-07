@@ -343,11 +343,11 @@ func TestNodeExporter_LastTransitionTimeFlapping(t *testing.T) {
 	}
 }
 
-// TestNodeExporter_SetHealthyResetsAfterFatal verifies that SetHealthy flips a
+// TestNodeExporter_HealthyResetsAfterFatal verifies that Healthy flips a
 // condition that's currently False back to its configured ready state with
 // Status=ConditionTrue. This is the missing transition path that left
 // AcceleratedHardwareReady stuck False after transient DCGM probe failures.
-func TestNodeExporter_SetHealthyResetsAfterFatal(t *testing.T) {
+func TestNodeExporter_HealthyResetsAfterFatal(t *testing.T) {
 	ctx := context.TODO()
 	fakeClient := fake.NewFakeClient()
 	nodeName := "test-node"
@@ -405,10 +405,10 @@ func TestNodeExporter_SetHealthyResetsAfterFatal(t *testing.T) {
 		t.Fatalf("Fatal condition was not reported to node: %v", err)
 	}
 
-	// 2. Now SetHealthy and confirm the condition flips back to True with the
+	// 2. Now Healthy and confirm the condition flips back to True with the
 	// configured ReadyReason/ReadyMessage.
-	if err := nodeExporter.SetHealthy(ctx, conditionType); err != nil {
-		t.Fatalf("SetHealthy failed: %v", err)
+	if err := nodeExporter.Healthy(ctx, conditionType); err != nil {
+		t.Fatalf("Healthy failed: %v", err)
 	}
 	reportChan <- time.Now()
 
@@ -425,15 +425,15 @@ func TestNodeExporter_SetHealthyResetsAfterFatal(t *testing.T) {
 		}
 		return nodeHasCondition(n, expectedTrue), nil
 	}); err != nil {
-		t.Fatalf("SetHealthy did not flip condition back to True: %v", err)
+		t.Fatalf("Healthy did not flip condition back to True: %v", err)
 	}
 }
 
-// TestNodeExporter_SetHealthyPreservesTransitionTimeIfAlreadyTrue verifies that
-// repeated SetHealthy calls on an already-True condition don't churn the
+// TestNodeExporter_HealthyPreservesTransitionTimeIfAlreadyTrue verifies that
+// repeated Healthy calls on an already-True condition don't churn the
 // LastTransitionTime — important so a happy-path monitor that's polled every
 // 5s with no errors doesn't update the transition time on every cycle.
-func TestNodeExporter_SetHealthyPreservesTransitionTimeIfAlreadyTrue(t *testing.T) {
+func TestNodeExporter_HealthyPreservesTransitionTimeIfAlreadyTrue(t *testing.T) {
 	ctx := context.TODO()
 	fakeClient := fake.NewFakeClient()
 	nodeName := "test-node"
@@ -463,7 +463,7 @@ func TestNodeExporter_SetHealthyPreservesTransitionTimeIfAlreadyTrue(t *testing.
 
 	// Initial state from initializeManagedConditions is already True; flush it
 	// to the API.
-	if err := nodeExporter.SetHealthy(ctx, conditionType); err != nil {
+	if err := nodeExporter.Healthy(ctx, conditionType); err != nil {
 		t.Fatal(err)
 	}
 	reportChan <- time.Now()
@@ -483,10 +483,10 @@ func TestNodeExporter_SetHealthyPreservesTransitionTimeIfAlreadyTrue(t *testing.
 		t.Fatal("transition time not set")
 	}
 
-	// Sleep past metav1.Now()'s 1s resolution, then SetHealthy again. The
+	// Sleep past metav1.Now()'s 1s resolution, then Healthy again. The
 	// transition time must NOT update because the status hasn't changed.
 	time.Sleep(time.Millisecond * 1100)
-	if err := nodeExporter.SetHealthy(ctx, conditionType); err != nil {
+	if err := nodeExporter.Healthy(ctx, conditionType); err != nil {
 		t.Fatal(err)
 	}
 	reportChan <- time.Now()
@@ -498,16 +498,16 @@ func TestNodeExporter_SetHealthyPreservesTransitionTimeIfAlreadyTrue(t *testing.
 	for _, c := range n.Status.Conditions {
 		if c.Type == conditionType {
 			if !c.LastTransitionTime.Time.Equal(ltt1) {
-				t.Errorf("LastTransitionTime updated on a no-op SetHealthy: was %v, now %v", ltt1, c.LastTransitionTime.Time)
+				t.Errorf("LastTransitionTime updated on a no-op Healthy: was %v, now %v", ltt1, c.LastTransitionTime.Time)
 			}
 		}
 	}
 }
 
-// TestNodeExporter_SetHealthyUnknownConditionType ensures SetHealthy errors
+// TestNodeExporter_HealthyUnknownConditionType ensures Healthy errors
 // (rather than panicking or silently writing) when called for a condition
 // type that wasn't registered with a NodeConditionConfig.
-func TestNodeExporter_SetHealthyUnknownConditionType(t *testing.T) {
+func TestNodeExporter_HealthyUnknownConditionType(t *testing.T) {
 	ctx := context.TODO()
 	fakeClient := fake.NewFakeClient()
 	initialNode := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
@@ -524,7 +524,7 @@ func TestNodeExporter_SetHealthyUnknownConditionType(t *testing.T) {
 		},
 	)
 
-	if err := nodeExporter.SetHealthy(ctx, "NotRegistered"); err == nil {
+	if err := nodeExporter.Healthy(ctx, "NotRegistered"); err == nil {
 		t.Fatal("expected error for unregistered condition type, got nil")
 	}
 }
