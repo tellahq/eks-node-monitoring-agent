@@ -3,6 +3,7 @@
 package dcgm
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -32,12 +33,16 @@ func TestShouldSwallowInitError(t *testing.T) {
 		lastShutdownAfter time.Duration // offset from construction; ignored if !everInitialized
 		nowAfter          time.Duration // offset from construction
 		want              bool
+		// wantDescriptorContains, when set, is asserted as a substring of the
+		// returned window descriptor when want=true. Empty when want=false.
+		wantDescriptorContains string
 	}{
 		{
-			name:      "boot grace open, never initialized — swallow",
-			bootGrace: 5 * time.Minute,
-			nowAfter:  90 * time.Second, // matches observed prod boot race
-			want:      true,
+			name:                   "boot grace open, never initialized — swallow",
+			bootGrace:              5 * time.Minute,
+			nowAfter:               90 * time.Second, // matches observed prod boot race
+			want:                   true,
+			wantDescriptorContains: "boot-grace",
 		},
 		{
 			name:      "boot grace closed, never initialized — surface",
@@ -58,12 +63,13 @@ func TestShouldSwallowInitError(t *testing.T) {
 			want:      false,
 		},
 		{
-			name:              "runtime grace open after first success — swallow",
-			runtimeGrace:      1 * time.Minute,
-			everInitialized:   true,
-			lastShutdownAfter: 10 * time.Minute,
-			nowAfter:          10*time.Minute + 30*time.Second,
-			want:              true,
+			name:                   "runtime grace open after first success — swallow",
+			runtimeGrace:           1 * time.Minute,
+			everInitialized:        true,
+			lastShutdownAfter:      10 * time.Minute,
+			nowAfter:               10*time.Minute + 30*time.Second,
+			want:                   true,
+			wantDescriptorContains: "runtime-grace",
 		},
 		{
 			name:              "runtime grace closed — surface",
@@ -103,9 +109,17 @@ func TestShouldSwallowInitError(t *testing.T) {
 				everInitialized: tt.everInitialized,
 				lastShutdown:    construction.Add(tt.lastShutdownAfter),
 			}
-			got := d.shouldSwallowInitError(construction.Add(tt.nowAfter))
+			got, descriptor := d.shouldSwallowInitError(construction.Add(tt.nowAfter))
 			if got != tt.want {
-				t.Errorf("shouldSwallowInitError = %v, want %v", got, tt.want)
+				t.Errorf("shouldSwallowInitError swallow = %v, want %v (descriptor=%q)", got, tt.want, descriptor)
+			}
+			if tt.want && tt.wantDescriptorContains != "" {
+				if !strings.Contains(descriptor, tt.wantDescriptorContains) {
+					t.Errorf("descriptor = %q, want substring %q", descriptor, tt.wantDescriptorContains)
+				}
+			}
+			if !tt.want && descriptor != "" {
+				t.Errorf("descriptor = %q on no-swallow path; want empty", descriptor)
 			}
 		})
 	}

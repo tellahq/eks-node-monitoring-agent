@@ -171,14 +171,25 @@ func (d *dcgmHelper) Reconcile(ctx context.Context) (bool, error) {
 		// init) absorbs the boot race against nv-hostengine startup;
 		// the InitializationGracePeriod (after a previous shutdown)
 		// absorbs runtime disconnects from a running DCGM. See
-		// shouldSwallowInitError for the policy.
-		if d.shouldSwallowInitError(time.Now()) {
+		// shouldSwallowInitError for the policy. Log at INFO so the
+		// suppression is visible in cluster logs — silent swallowing
+		// for minutes-long windows would be opaque if a node's DCGM
+		// is genuinely broken.
+		if swallow, descriptor := d.shouldSwallowInitError(time.Now()); swallow {
+			logger.Info("DCGM init failed; suppressing error during grace window",
+				"window", descriptor,
+				"address", d.config.Address,
+				"error", err.Error(),
+			)
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to initialize DCGM: %w", err)
 	}
 	d.initialized = true
-	d.everInitialized = true
+	// d.everInitialized is set further down, after all feature setup
+	// succeeds — see the bottom of this function. Setting it here
+	// would prematurely transition out of boot-grace if a later
+	// HealthSet/FieldsInit/etc. step fails.
 
 	if slices.Contains(d.config.Features, FeaturePolicyViolations) {
 		// DCGM defines lets clients define error policies and notifies subscribers
@@ -246,6 +257,17 @@ func (d *dcgmHelper) Reconcile(ctx context.Context) (bool, error) {
 		})
 	}
 
+	// Mark "we have ever fully initialized DCGM" only after every feature
+	// setup above has succeeded. If any step short-circuits with an error,
+	// the next Reconcile is still treated as a first-init attempt and the
+	// boot grace window remains active — letting the slow-feature path
+	// keep retrying without prematurely surfacing a Fatal. Pre-existing
+	// nuance: d.initialized is set right after dcgmapi.Init succeeds and
+	// is NOT rewound on partial-feature failure; the next Reconcile takes
+	// the Introspect-fast-path. That's a separate latent issue not
+	// addressed by this change.
+	d.everInitialized = true
+
 	return true, nil
 }
 
@@ -283,9 +305,14 @@ func (d *dcgmHelper) GetDeviceCount() (uint, error) {
 	return dcgmapi.GetAllDeviceCount()
 }
 
-// shouldSwallowInitError returns true if a dcgmapi.Init failure at the given
-// time should be silently swallowed (returned to the manager as success-with-
-// no-init) rather than surfaced as a DCGMError condition. Two windows apply:
+// shouldSwallowInitError returns (true, descriptor) if a dcgmapi.Init failure
+// at the given time should be silently swallowed (returned to the manager as
+// success-with-no-init) rather than surfaced as a DCGMError condition. The
+// descriptor identifies which grace window applied and how much of it has
+// elapsed, so the caller can log enough context to make the silent
+// suppression observable in cluster logs. Returns (false, "") otherwise.
+//
+// Two windows apply:
 //
 //   - Before any successful init has ever occurred (everInitialized=false),
 //     errors within BootGracePeriod after construction are swallowed. This
@@ -298,17 +325,27 @@ func (d *dcgmHelper) GetDeviceCount() (uint, error) {
 //
 // Both windows default to closed (no swallow) if their period is zero, so
 // this preserves prior behavior for callers that don't set BootGracePeriod.
-func (d *dcgmHelper) shouldSwallowInitError(now time.Time) bool {
+func (d *dcgmHelper) shouldSwallowInitError(now time.Time) (bool, string) {
 	if !d.everInitialized {
 		if d.config.BootGracePeriod <= 0 {
-			return false
+			return false, ""
 		}
-		return now.Before(d.constructedAt.Add(d.config.BootGracePeriod))
+		elapsed := now.Sub(d.constructedAt)
+		if elapsed < d.config.BootGracePeriod {
+			return true, fmt.Sprintf("boot-grace (elapsed %s of %s)",
+				elapsed.Round(time.Second), d.config.BootGracePeriod)
+		}
+		return false, ""
 	}
 	if d.config.InitializationGracePeriod <= 0 {
-		return false
+		return false, ""
 	}
-	return now.Before(d.lastShutdown.Add(d.config.InitializationGracePeriod))
+	elapsed := now.Sub(d.lastShutdown)
+	if elapsed < d.config.InitializationGracePeriod {
+		return true, fmt.Sprintf("runtime-grace (elapsed %s of %s)",
+			elapsed.Round(time.Second), d.config.InitializationGracePeriod)
+	}
+	return false, ""
 }
 
 func (d *dcgmHelper) shutdown() error {
