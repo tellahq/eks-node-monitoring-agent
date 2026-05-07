@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -34,13 +35,14 @@ func init() {
 	)
 }
 
-// defaultRecoveryThreshold is how long a monitor must report no Fatal
-// conditions before the manager auto-recovers its managed condition back
-// to Healthy. Sized at ~6 polling cycles (poll interval is 5s) — long
-// enough that brief transients during reconcile don't bounce a True/False
-// flap, short enough that recovery happens well within Karpenter
-// NodeRepair's tolerationDuration so a transient False doesn't
-// false-positive trigger node replacement.
+// defaultRecoveryThreshold is how long a monitor must go without emitting
+// a Fatal condition before the manager auto-recovers its managed condition
+// back to Healthy. Sized at ~6 polling cycles (poll interval is 5s) so
+// brief transients during reconcile don't bounce a True/False flap, and
+// well below Karpenter NodeRepair's per-condition tolerationDuration
+// (which is on the order of minutes for most conditions) so a transient
+// False that resolves quickly doesn't false-positive trigger node
+// replacement.
 const defaultRecoveryThreshold = 30 * time.Second
 
 // MonitorManager manages the lifecycle of monitors and routes their notifications
@@ -54,10 +56,17 @@ type MonitorManager struct {
 	exporter          Exporter
 
 	// monitorFatalAt tracks the most recent time each monitor emitted a
-	// Fatal condition. Used by the auto-recovery path: a monitor that's
-	// been quiet for `recoveryThreshold` after its last Fatal triggers
-	// SetHealthy on its managed condition.
+	// Fatal condition that was actually delivered to the exporter (i.e.
+	// not suppressed by MinOccurrences). Used by the auto-recovery path:
+	// a monitor that's been quiet for `recoveryThreshold` after its last
+	// Fatal triggers SetHealthy on its managed condition.
+	//
+	// Protected by monitorFatalAtMu. In practice everything that touches
+	// it runs from a single goroutine inside runLoop, but exporting
+	// SetRecoveryThreshold and the public-ness of MonitorManager mean a
+	// future caller could race; the lock is cheap insurance.
 	monitorFatalAt    map[string]time.Time
+	monitorFatalAtMu  sync.Mutex
 	recoveryThreshold time.Duration
 }
 
@@ -81,8 +90,23 @@ func NewMonitorManager(nodeName string, exporter Exporter) *MonitorManager {
 	}
 }
 
-// Register registers a monitor with the manager
+// Register registers a monitor with the manager.
+//
+// Each monitor must own its conditionType uniquely: the auto-recovery path
+// and the Fatal-counting Prometheus gauge both assume one-monitor-per-
+// conditionType (otherwise two monitors mapped to the same conditionType
+// could fight over the recovery timestamp + gauge state). Register rejects
+// double-registrations and conditionType collisions to make the invariant
+// load-bearing.
 func (m *MonitorManager) Register(ctx context.Context, mon monitor.Monitor, conditionType corev1.NodeConditionType) error {
+	if _, exists := m.monitors[mon.Name()]; exists {
+		return fmt.Errorf("monitor %q is already registered", mon.Name())
+	}
+	for existingName, existingType := range m.conditionTypeMap {
+		if existingType == conditionType {
+			return fmt.Errorf("conditionType %q is already owned by monitor %q", conditionType, existingName)
+		}
+	}
 	m.monitors[mon.Name()] = mon
 	m.conditionTypeMap[mon.Name()] = conditionType
 	return mon.Register(ctx, makeManagerWrapper(m, mon))
@@ -127,47 +151,58 @@ func (m *MonitorManager) runLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-pollTicker.C:
-			// Poll monitors for their current conditions. After processing each
-			// monitor's response, decide whether to auto-recover its managed
-			// condition: if the monitor returned no conditions at all and we
-			// previously recorded a Fatal for it, and enough wall-clock time
-			// has elapsed since that Fatal, flip the managed condition back to
-			// Healthy. This restores the missing Fatal -> True transition path
-			// for monitors that signal recovery via absence of conditions
-			// (the framework's documented contract — see
-			// monitors/nvidia/dcgm/dcgm_reconcile.go: success returns nil/nil).
+			// Poll monitors for their current conditions. After processing
+			// each monitor's response, decide whether to auto-recover its
+			// managed condition: if the monitor did NOT emit a delivered
+			// Fatal this cycle, and we previously recorded a Fatal for it,
+			// and enough wall-clock time has elapsed since that Fatal, flip
+			// the managed condition back to Healthy. This restores the
+			// missing Fatal -> True transition path. The predicate is
+			// "no Fatal this cycle" (not "no conditions at all") because
+			// non-Fatal severities (Info/Warning) only produce events and
+			// don't write the managed condition — so their presence isn't
+			// evidence of an unhealthy managed-condition state.
 			for _, mon := range m.monitors {
 				conds := mon.Conditions()
-				sawFatal := false
+				sawFatalDelivered := false
 				for _, cond := range conds {
-					if err := m.exportCondition(ctx, mon.Name(), cond); err != nil {
+					delivered, err := m.exportCondition(ctx, mon.Name(), cond)
+					if err != nil {
 						logger.Error(err, "failed to export condition", "source", mon.Name(), "condition", cond)
 					}
-					if cond.Severity == monitor.SeverityFatal {
-						sawFatal = true
+					if delivered && cond.Severity == monitor.SeverityFatal {
+						sawFatalDelivered = true
 					}
 				}
-				if sawFatal {
-					m.monitorFatalAt[mon.Name()] = time.Now()
-				} else if len(conds) == 0 {
+				if sawFatalDelivered {
+					m.recordFatalAt(mon.Name(), time.Now())
+				} else {
 					m.maybeAutoRecover(ctx, mon.Name())
 				}
-				// If conds is non-empty but contains only Info/Warning, the
-				// monitor is still signaling something — leave the managed
-				// condition alone and don't auto-recover yet.
 			}
 		case notif := <-m.notifyChan:
-			if err := m.exportCondition(ctx, notif.monitorName, notif.condition); err != nil {
+			delivered, err := m.exportCondition(ctx, notif.monitorName, notif.condition)
+			if err != nil {
 				logger.Error(err, "failed to export condition",
 					"monitor", notif.monitorName,
 					"condition", notif.condition,
 				)
 			}
-			if notif.condition.Severity == monitor.SeverityFatal {
-				m.monitorFatalAt[notif.monitorName] = time.Now()
+			if delivered && notif.condition.Severity == monitor.SeverityFatal {
+				m.recordFatalAt(notif.monitorName, time.Now())
 			}
 		}
 	}
+}
+
+// recordFatalAt notes that the named monitor emitted a delivered Fatal at
+// the given time. The auto-recovery path treats this as the start of the
+// quiet-period clock; the next clean polling cycle (no Fatal) at least
+// recoveryThreshold later flips the managed condition back to Healthy.
+func (m *MonitorManager) recordFatalAt(monitorName string, t time.Time) {
+	m.monitorFatalAtMu.Lock()
+	defer m.monitorFatalAtMu.Unlock()
+	m.monitorFatalAt[monitorName] = t
 }
 
 // maybeAutoRecover flips the managed condition for the named monitor back to
@@ -176,7 +211,10 @@ func (m *MonitorManager) runLoop(ctx context.Context) error {
 // enough time has passed since the most recent Fatal.
 func (m *MonitorManager) maybeAutoRecover(ctx context.Context, monitorName string) {
 	logger := log.FromContext(ctx)
+
+	m.monitorFatalAtMu.Lock()
 	fatalAt, ok := m.monitorFatalAt[monitorName]
+	m.monitorFatalAtMu.Unlock()
 	if !ok {
 		return
 	}
@@ -185,6 +223,11 @@ func (m *MonitorManager) maybeAutoRecover(ctx context.Context, monitorName strin
 	}
 	conditionType, ok := m.conditionTypeMap[monitorName]
 	if !ok {
+		// Defensive: a monitor in monitorFatalAt without a conditionType
+		// means Register's invariants were violated. Log and bail.
+		logger.Error(nil, "monitor has Fatal timestamp but no conditionType mapping",
+			"monitor", monitorName,
+		)
 		return
 	}
 	if err := m.exporter.SetHealthy(ctx, conditionType); err != nil {
@@ -199,11 +242,20 @@ func (m *MonitorManager) maybeAutoRecover(ctx context.Context, monitorName strin
 		"conditionType", conditionType,
 		"quietFor", time.Since(fatalAt).Round(time.Second).String(),
 	)
+	m.monitorFatalAtMu.Lock()
 	delete(m.monitorFatalAt, monitorName)
+	m.monitorFatalAtMu.Unlock()
 	conditionTypeGauge.WithLabelValues(string(conditionType)).Set(0)
 }
 
-func (m *MonitorManager) exportCondition(ctx context.Context, monitorName string, condition monitor.Condition) error {
+// exportCondition forwards a condition from a monitor to the exporter,
+// applying the MinOccurrences gate first. Returns (delivered, err) where
+// delivered=true iff the condition was actually sent to the exporter
+// (i.e. not suppressed by MinOccurrences). Callers use this to decide
+// whether to update bookkeeping that depends on the condition having
+// actually been delivered (e.g. monitorFatalAt for the auto-recovery
+// timer).
+func (m *MonitorManager) exportCondition(ctx context.Context, monitorName string, condition monitor.Condition) (bool, error) {
 	logger := log.FromContext(ctx).WithValues("source", monitorName, "condition", condition)
 
 	// track condition metrics
@@ -211,7 +263,7 @@ func (m *MonitorManager) exportCondition(ctx context.Context, monitorName string
 
 	conditionType, ok := m.conditionTypeMap[monitorName]
 	if !ok {
-		return fmt.Errorf("missing condition type mapping for monitor: %s", monitorName)
+		return false, fmt.Errorf("missing condition type mapping for monitor: %s", monitorName)
 	}
 	logger = logger.WithValues("conditionType", conditionType)
 
@@ -219,11 +271,14 @@ func (m *MonitorManager) exportCondition(ctx context.Context, monitorName string
 	if m.conditionCountMap[condition.Reason] < condition.MinOccurrences {
 		logger.Info("condition has not met MinOccurrences", "occurrences", m.conditionCountMap[condition.Reason])
 		m.conditionCountMap[condition.Reason] += 1
-		return nil
+		return false, nil
 	}
 	m.conditionCountMap[condition.Reason] = 0
 
-	return m.SendCondition(ctx, condition, conditionType)
+	if err := m.SendCondition(ctx, condition, conditionType); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // SendCondition sends a condition to the exporter based on severity

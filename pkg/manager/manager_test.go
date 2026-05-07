@@ -2,6 +2,8 @@ package manager_test
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,8 +27,11 @@ func (m *mockMonitor) Register(ctx context.Context, mgr monitor.Manager) error {
 
 func NewManagerWithExporterFuncs(fns ...func(*mockExporter)) (*manager.MonitorManager, *mockExporter) {
 	mockExp := &mockExporter{
-		notifyChan:     make(chan struct{}),
-		setHealthyChan: make(chan struct{}, 1),
+		// Buffered so a polling-loop monitor that reports Fatal repeatedly
+		// doesn't block runLoop on an unread channel send. Existing tests
+		// that read exactly once still work; new tests that drain in a
+		// fan-out also work.
+		notifyChan: make(chan struct{}, 256),
 	}
 	for _, fn := range fns {
 		fn(mockExp)
@@ -35,14 +40,16 @@ func NewManagerWithExporterFuncs(fns ...func(*mockExporter)) (*manager.MonitorMa
 	return mockManager, mockExp
 }
 
+// mockExporter implements manager.Exporter for tests. Info/Warning/Fatal push
+// onto notifyChan so tests can synchronously block-and-wait for an export.
+// SetHealthy increments setHealthyCount atomically; tests assert on the
+// counter value, which is more reliable than a buffered-channel idiom that
+// loses signal under racy schedules and can hide regressions where
+// SetHealthy is called too often.
 type mockExporter struct {
-	// notifyChan receives a struct{} for every Info/Warning/Fatal call.
-	notifyChan chan struct{}
-	// setHealthyChan receives a struct{} for every SetHealthy call. Buffered
-	// (size 1) so tests can assert "got at least one" without racing against
-	// the send. Tests select on this channel to verify the auto-recovery
-	// path fired.
-	setHealthyChan chan struct{}
+	notifyChan       chan struct{}
+	setHealthyCount  atomic.Int64
+	setHealthyByType sync.Map // map[corev1.NodeConditionType]int64
 }
 
 func (e *mockExporter) notify() error {
@@ -58,15 +65,17 @@ func (e *mockExporter) Warning(context.Context, monitor.Condition, corev1.NodeCo
 func (e *mockExporter) Fatal(context.Context, monitor.Condition, corev1.NodeConditionType) error {
 	return e.notify()
 }
-func (e *mockExporter) SetHealthy(context.Context, corev1.NodeConditionType) error {
-	select {
-	case e.setHealthyChan <- struct{}{}:
-	default:
-		// non-blocking — tests only need to know SetHealthy fired at least
-		// once, and the manager polls on a ticker so subsequent calls are
-		// expected.
-	}
+func (e *mockExporter) SetHealthy(_ context.Context, ct corev1.NodeConditionType) error {
+	e.setHealthyCount.Add(1)
+	v, _ := e.setHealthyByType.LoadOrStore(ct, new(int64))
+	atomic.AddInt64(v.(*int64), 1)
 	return nil
+}
+
+// setHealthyCalls returns the total number of SetHealthy invocations across
+// all condition types.
+func (e *mockExporter) setHealthyCalls() int64 {
+	return e.setHealthyCount.Load()
 }
 
 func TestManager_Notification(t *testing.T) {
@@ -166,12 +175,12 @@ func TestManager_CreateObserver(t *testing.T) {
 
 // TestManager_AutoRecoveryAfterFatalGoesQuiet verifies the manager flips a
 // managed condition back to Healthy when a monitor that previously emitted
-// Fatal subsequently returns no conditions for at least the recovery
+// Fatal subsequently does not emit Fatal for at least the recovery
 // threshold. This is the missing Fatal -> True transition path: monitors
-// signal recovery via absence of conditions (see
-// monitors/nvidia/dcgm/dcgm_reconcile.go: success path returns nil/nil), and
-// the framework now interprets that absence after a quiet period as
-// "recovered" rather than "no signal".
+// signal recovery via absence of Fatal (see
+// monitors/nvidia/dcgm/dcgm_reconcile.go: success returns nil/nil), and the
+// framework now interprets that absence after a quiet period as "recovered"
+// rather than "no signal".
 //
 // Test takes ~5s because the manager's poll ticker is hardcoded at 5s.
 func TestManager_AutoRecoveryAfterFatalGoesQuiet(t *testing.T) {
@@ -194,9 +203,6 @@ func TestManager_AutoRecoveryAfterFatalGoesQuiet(t *testing.T) {
 	}
 
 	mMgr, mockExp := NewManagerWithExporterFuncs()
-	// Tighten the threshold so we don't have to wait the default 30s; the
-	// poll cycle is still 5s so a recovery in the second poll is the fastest
-	// observable signal.
 	mMgr.SetRecoveryThreshold(50 * time.Millisecond)
 
 	if err := mMgr.Register(ctx, mockMon, "AcceleratedHardwareReady"); err != nil {
@@ -213,24 +219,26 @@ func TestManager_AutoRecoveryAfterFatalGoesQuiet(t *testing.T) {
 
 	// Then expect SetHealthy on a subsequent poll cycle (after recovery
 	// threshold elapses and the poll ticker fires — within ~5-10s).
-	select {
-	case <-mockExp.setHealthyChan:
-		// pass
-	case <-ctx.Done():
-		t.Fatal("auto-recovery never fired (SetHealthy not called):", ctx.Err())
+	for {
+		if mockExp.setHealthyCalls() >= 1 {
+			return
+		}
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("auto-recovery never fired (SetHealthy not called): %v", ctx.Err())
+		}
 	}
 }
 
-// TestManager_NoRecoveryWhileMonitorStillReportingFatal asserts that the
-// manager does NOT auto-recover while the monitor is still reporting a Fatal
-// on each poll. monitorFatalAt should keep getting bumped, preventing the
-// quiet-period from elapsing.
+// TestManager_NoRecoveryWhileMonitorStillReportingFatal asserts the manager
+// does NOT auto-recover while the monitor is still reporting a Fatal on each
+// poll. monitorFatalAt should keep getting bumped, preventing the quiet
+// period from elapsing.
 func TestManager_NoRecoveryWhileMonitorStillReportingFatal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
-	// Monitor that returns Fatal on every Conditions() poll (steady-state
-	// genuine failure).
 	mockMon := &chattyFatalMonitor{}
 
 	mMgr, mockExp := NewManagerWithExporterFuncs()
@@ -241,21 +249,71 @@ func TestManager_NoRecoveryWhileMonitorStillReportingFatal(t *testing.T) {
 	}
 	go func() { _ = mMgr.Start(ctx) }()
 
-	// Drain Fatal notifications as they arrive (the polling loop sends one
-	// every 5s). We expect at least one within the test window.
+	// Wait the full test window. SetHealthy should never be called — the
+	// monitor keeps emitting Fatal so the recovery clock keeps resetting.
 	gotFatal := false
+	deadline := time.NewTimer(11 * time.Second)
+	defer deadline.Stop()
+loop:
 	for {
 		select {
 		case <-mockExp.notifyChan:
 			gotFatal = true
-		case <-mockExp.setHealthyChan:
-			t.Fatal("SetHealthy was called while monitor was still reporting Fatal — auto-recovery should not fire")
+		case <-deadline.C:
+			break loop
 		case <-ctx.Done():
-			if !gotFatal {
-				t.Fatal("never received a Fatal — test setup wrong:", ctx.Err())
-			}
-			return
+			break loop
 		}
+	}
+	if !gotFatal {
+		t.Fatalf("never received a Fatal — test setup wrong")
+	}
+	if calls := mockExp.setHealthyCalls(); calls != 0 {
+		t.Fatalf("SetHealthy was called %d times while monitor was still reporting Fatal — auto-recovery should not fire", calls)
+	}
+}
+
+// TestManager_AutoRecoveryReArmsAfterRecovery verifies a Fatal -> recover
+// -> Fatal -> recover cycle works correctly. The first recovery clears
+// monitorFatalAt; the second Fatal must re-arm it so the second recovery
+// fires after another full quiet period (not immediately).
+func TestManager_AutoRecoveryReArmsAfterRecovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	mon := &switchableMonitor{}
+	mMgr, mockExp := NewManagerWithExporterFuncs()
+	mMgr.SetRecoveryThreshold(50 * time.Millisecond)
+
+	if err := mMgr.Register(ctx, mon, "AcceleratedHardwareReady"); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = mMgr.Start(ctx) }()
+
+	// Phase 1: monitor returns Fatal — wait for a delivered Fatal.
+	mon.setEmit("fatal")
+	if err := waitFor(ctx, func() bool { return mockExp.setHealthyCalls() == 0 && mockExp.fatalDelivered() }, 8*time.Second); err != nil {
+		t.Fatalf("phase 1: never observed Fatal delivery: %v", err)
+	}
+
+	// Phase 2: monitor goes quiet — first recovery should fire.
+	mon.setEmit("none")
+	wantCalls := int64(1)
+	if err := waitFor(ctx, func() bool { return mockExp.setHealthyCalls() >= wantCalls }, 10*time.Second); err != nil {
+		t.Fatalf("phase 2: first recovery never fired: %v", err)
+	}
+
+	// Phase 3: monitor goes Fatal again — recovery clock must re-arm.
+	mon.setEmit("fatal")
+	if err := waitFor(ctx, func() bool { return mockExp.fatalDelivered() }, 8*time.Second); err != nil {
+		t.Fatalf("phase 3: never observed re-Fatal delivery: %v", err)
+	}
+
+	// Phase 4: monitor quiet again — second recovery should fire (counter > 1).
+	mon.setEmit("none")
+	wantCalls = mockExp.setHealthyCalls() + 1
+	if err := waitFor(ctx, func() bool { return mockExp.setHealthyCalls() >= wantCalls }, 10*time.Second); err != nil {
+		t.Fatalf("phase 4: second recovery never fired (re-arm broken): %v", err)
 	}
 }
 
@@ -268,4 +326,52 @@ func (m *chattyFatalMonitor) Conditions() []monitor.Condition {
 }
 func (m *chattyFatalMonitor) Register(ctx context.Context, mgr monitor.Manager) error {
 	return nil
+}
+
+// switchableMonitor lets a test toggle what the monitor emits between
+// polls. emit values: "fatal" -> [Fatal], "none" -> [].
+type switchableMonitor struct {
+	emit atomic.Value // string
+}
+
+func (m *switchableMonitor) setEmit(v string)                                     { m.emit.Store(v) }
+func (m *switchableMonitor) Name() string                                         { return "switchable" }
+func (m *switchableMonitor) Register(context.Context, monitor.Manager) error { return nil }
+func (m *switchableMonitor) Conditions() []monitor.Condition {
+	v, _ := m.emit.Load().(string)
+	if v == "fatal" {
+		return []monitor.Condition{{Reason: "DCGMError", Severity: monitor.SeverityFatal}}
+	}
+	return nil
+}
+
+// waitFor polls predicate every 100ms until true or timeout.
+func waitFor(ctx context.Context, predicate func() bool, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if predicate() {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return context.DeadlineExceeded
+		}
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// fatalDelivered drains pending notifyChan signals and returns true if at
+// least one was observed since the last call (which is sufficient for
+// "Fatal was delivered" assertions in tests where the chatty path emits
+// every poll cycle).
+func (e *mockExporter) fatalDelivered() bool {
+	select {
+	case <-e.notifyChan:
+		return true
+	default:
+		return false
+	}
 }

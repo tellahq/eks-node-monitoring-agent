@@ -150,8 +150,10 @@ func (e *nodeExporter) Fatal(ctx context.Context, monitorCondition monitor.Condi
 // NodeConditionConfig passed to NewNodeExporter). Used by the manager's
 // auto-recovery path to flip a previously-Fatal condition back to True once
 // the underlying monitor has stopped reporting errors for the recovery
-// threshold. If the condition was already True the local state is left intact
-// (LastTransitionTime preserved) so we don't generate spurious flap.
+// threshold. If the local cache already reflects the configured ready state
+// this is a pure no-op (no dirty bit, no apiserver patch on the next report
+// tick) — a small but useful optimization since maybeAutoRecover may end up
+// calling SetHealthy on every poll cycle for monitors that never go Fatal.
 func (e *nodeExporter) SetHealthy(ctx context.Context, conditionType corev1.NodeConditionType) error {
 	config, ok := e.managedConditionConfigs[conditionType]
 	if !ok {
@@ -159,6 +161,17 @@ func (e *nodeExporter) SetHealthy(ctx context.Context, conditionType corev1.Node
 	}
 	e.managedConditionsLock.Lock()
 	defer e.managedConditionsLock.Unlock()
+
+	// No-op fast path: local cache already matches the configured ready state.
+	// Skip the write and don't dirty the condition map — there's nothing to
+	// report to the apiserver.
+	if old, ok := e.managedConditions[conditionType]; ok &&
+		old.Status == corev1.ConditionTrue &&
+		old.Reason == config.ReadyReason &&
+		old.Message == config.ReadyMessage {
+		return nil
+	}
+
 	now := metav1.Now()
 	newCondition := corev1.NodeCondition{
 		Type:               conditionType,
@@ -169,8 +182,10 @@ func (e *nodeExporter) SetHealthy(ctx context.Context, conditionType corev1.Node
 		LastHeartbeatTime:  now,
 	}
 	if old, ok := e.managedConditions[conditionType]; ok && old.Status == corev1.ConditionTrue {
-		// Already healthy — preserve the existing transition time so the
-		// recovery isn't recorded as a fresh transition every poll cycle.
+		// Already True but reason/message drifted — preserve the existing
+		// transition time so the recovery isn't recorded as a fresh
+		// transition. The fast path above already handled the strict no-op
+		// case; this branch only fires if reason or message changed.
 		newCondition.LastTransitionTime = old.LastTransitionTime
 	}
 	e.managedConditions[conditionType] = newCondition
