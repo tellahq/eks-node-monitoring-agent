@@ -21,7 +21,22 @@ import (
 
 var _ monitor.Monitor = (*nvidiaMonitor)(nil)
 
-var dcgmClientInializationGracePeriod = time.Minute
+var (
+	// dcgmClientInializationGracePeriod tolerates runtime disconnects from a
+	// previously-healthy DCGM (e.g. nv-hostengine restart). Sized small
+	// because a healthy node should reconnect quickly; longer values mask
+	// real failures.
+	dcgmClientInializationGracePeriod = time.Minute
+
+	// dcgmClientBootGracePeriod tolerates the boot race between NMA pod
+	// startup and dcgm-server's nv-hostengine becoming reachable. Sized
+	// generously because we have observed this race resolve in ~75-90s on
+	// production GPU nodes — values shorter than that produced false-positive
+	// AcceleratedHardwareReady=False conditions on otherwise-healthy nodes.
+	// Only applies before the first successful DCGM init; once we've
+	// connected, dcgmClientInializationGracePeriod takes over.
+	dcgmClientBootGracePeriod = 5 * time.Minute
+)
 
 func init() {
 	if durationStr, ok := os.LookupEnv("DCGM_GRACE_PERIOD_DURATION"); ok {
@@ -30,12 +45,19 @@ func init() {
 			dcgmClientInializationGracePeriod = duration
 		}
 	}
+	if durationStr, ok := os.LookupEnv("DCGM_BOOT_GRACE_PERIOD_DURATION"); ok {
+		duration, err := time.ParseDuration(durationStr)
+		if err == nil {
+			dcgmClientBootGracePeriod = duration
+		}
+	}
 }
 
 func NewNvidiaMonitor() *nvidiaMonitor {
 	return &nvidiaMonitor{
 		dcgmClient: dcgm.NewDCGM(dcgm.DCGMConfig{
 			InitializationGracePeriod: dcgmClientInializationGracePeriod,
+			BootGracePeriod:           dcgmClientBootGracePeriod,
 			Features: []dcgm.Feature{
 				dcgm.FeatureActiveDiagnostics,
 				dcgm.FeatureFields,
